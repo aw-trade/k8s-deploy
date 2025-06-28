@@ -1,0 +1,274 @@
+# ===================================================
+# NAMESPACE
+# ===================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: trading-system
+---
+
+# ===================================================
+# 1. MARKET STREAMER (Base Service)
+# ===================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: market-streamer
+  namespace: trading-system
+  labels:
+    app: market-streamer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: market-streamer
+  template:
+    metadata:
+      labels:
+        app: market-streamer
+    spec:
+      containers:
+      - name: market-streamer
+        image: market-streamer:latest
+        imagePullPolicy: Never  # Changed from IfNotPresent to Never
+        ports:
+        - containerPort: 8888
+          protocol: UDP
+          name: udp-stream
+        env:
+        - name: BIND_ADDR
+          value: "0.0.0.0:8888"
+        - name: RUST_LOG
+          value: "debug"
+        - name: SERVICE_NAME
+          value: "market-streamer"
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: market-streamer-service
+  namespace: trading-system
+spec:
+  selector:
+    app: market-streamer
+  ports:
+  - port: 8888
+    targetPort: 8888
+    protocol: UDP
+    name: udp-stream
+  type: ClusterIP
+
+---
+
+# ===================================================
+# 2. ORDER BOOK ALGORITHM (Depends on Market Streamer)
+# ===================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-book-algo
+  namespace: trading-system
+  labels:
+    app: order-book-algo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: order-book-algo
+  template:
+    metadata:
+      labels:
+        app: order-book-algo
+    spec:
+      # Wait for market-streamer to be ready before starting
+      initContainers:
+      - name: wait-for-streamer
+        image: busybox:1.35
+        command: ['sh', '-c']
+        args:
+        - |
+          echo "Waiting for market-streamer service..."
+          until nslookup market-streamer-service; do
+            echo "Waiting for market-streamer-service DNS..."
+            sleep 3
+          done
+          echo "market-streamer service DNS is ready!"
+          sleep 5
+          echo "Giving market-streamer time to fully start..."
+      containers:
+      - name: order-book-algo
+        image: order-book-algo:latest
+        imagePullPolicy: Never  # Changed from IfNotPresent to Never
+        ports:
+        - containerPort: 9999
+          protocol: UDP
+          name: signal-output
+        env:
+        - name: STREAMING_SOURCE_IP
+          value: "market-streamer-service"
+        - name: STREAMING_SOURCE_PORT
+          value: "8888"
+        - name: RUST_LOG
+          value: "debug"
+        - name: SERVICE_NAME
+          value: "order-book-algo"
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-book-algo-service
+  namespace: trading-system
+spec:
+  selector:
+    app: order-book-algo
+  ports:
+  - port: 9999
+    targetPort: 9999
+    protocol: UDP
+    name: signal-output
+  type: ClusterIP
+
+---
+
+# ===================================================
+# 3. TRADE SIMULATOR (Depends on Order Book Algorithm)
+# ===================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trade-simulator
+  namespace: trading-system
+  labels:
+    app: trade-simulator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trade-simulator
+  template:
+    metadata:
+      labels:
+        app: trade-simulator
+    spec:
+      # Wait for order-book-algo to be ready before starting
+      initContainers:
+      - name: wait-for-algorithm
+        image: busybox:1.35
+        command: ['sh', '-c']
+        args:
+        - |
+          echo "Waiting for order-book-algo service..."
+          until nslookup order-book-algo-service; do
+            echo "Waiting for order-book-algo-service DNS..."
+            sleep 3
+          done
+          echo "order-book-algo service DNS is ready!"
+          sleep 10
+          echo "Giving order-book-algo time to fully start..."
+      containers:
+      - name: trade-simulator
+        image: trade-simulator:latest
+        imagePullPolicy: Never  # Changed from IfNotPresent to Never
+        env:
+        - name: ALGORITHM_SOURCE_IP
+          value: "order-book-algo-service"
+        - name: ALGORITHM_SOURCE_PORT
+          value: "9999"
+        - name: RUST_LOG
+          value: "debug"
+        - name: SERVICE_NAME
+          value: "trade-simulator"
+        args: 
+        - "--algo-ip"
+        - "order-book-algo-service"
+        - "--algo-port" 
+        - "9999"
+        - "--verbose"
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
+
+---
+
+# ===================================================
+# EXTERNAL ACCESS VIA NODEPORT (For Kind Cluster)
+# ===================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: market-streamer-external
+  namespace: trading-system
+  labels:
+    service: external-access
+spec:
+  selector:
+    app: market-streamer
+  ports:
+  - port: 8888
+    targetPort: 8888
+    nodePort: 30080
+    protocol: UDP
+    name: udp-stream
+  type: NodePort
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-book-algo-external
+  namespace: trading-system
+  labels:
+    service: external-access
+spec:
+  selector:
+    app: order-book-algo
+  ports:
+  - port: 9999
+    targetPort: 9999
+    nodePort: 30081
+    protocol: UDP
+    name: signal-output
+  type: NodePort
+
+---
+
+# ===================================================
+# CONFIGMAP FOR CONFIGURATION
+# ===================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trading-config
+  namespace: trading-system
+data:
+  # Market Streamer Config
+  BIND_ADDR: "0.0.0.0:8888"
+  
+  # Order Book Algorithm Config
+  STREAMING_SOURCE_IP: "market-streamer-service.trading-system.svc.cluster.local"
+  STREAMING_SOURCE_PORT: "8888"
+  
+  # Trade Simulator Config  
+  ALGORITHM_SOURCE_IP: "order-book-algo-service.trading-system.svc.cluster.local"
+  ALGORITHM_SOURCE_PORT: "9999"
+  
+  # Common Config
+  RUST_LOG: "info"
