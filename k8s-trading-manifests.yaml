@@ -118,7 +118,7 @@ spec:
           name: signal-output
         env:
         - name: STREAMING_SOURCE_IP
-          value: "market-streamer-service.trading-system.svc.cluster.local"  # Use FQDN
+          value: "market-streamer-service"
         - name: STREAMING_SOURCE_PORT
           value: "8888"
         - name: RUST_LOG
