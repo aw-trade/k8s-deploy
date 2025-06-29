@@ -95,13 +95,19 @@ spec:
         args:
         - |
           echo "Waiting for market-streamer service..."
-          until nslookup market-streamer-service; do
+          # Use fully qualified domain name
+          until nslookup market-streamer-service.trading-system.svc.cluster.local; do
             echo "Waiting for market-streamer-service DNS..."
             sleep 3
           done
           echo "market-streamer service DNS is ready!"
-          sleep 5
+          
+          # Additional check: try to connect to the service port
+          echo "Testing UDP port connectivity..."
+          timeout 10 nc -u -w 1 market-streamer-service.trading-system.svc.cluster.local 8888 && echo "Port 8888 is reachable" || echo "Port 8888 check failed (normal for UDP)"
+          
           echo "Giving market-streamer time to fully start..."
+          sleep 5
       containers:
       - name: order-book-algo
         image: order-book-algo:latest
@@ -172,7 +178,7 @@ spec:
         args:
         - |
           echo "Waiting for order-book-algo service..."
-          until nslookup order-book-algo-service; do
+          until nslookup order-book-algo-service.trading-system.svc.cluster.local; do
             echo "Waiting for order-book-algo-service DNS..."
             sleep 3
           done
