@@ -96,17 +96,10 @@ spec:
     ports:
     - port: 12000
       targetPort: 12000
-    - port: 12001
-      targetPort: 12001
   webhook:
-    start-algorithm:
+    algo-order-book:
       port: "12000"
-      endpoint: /start-algorithm
-      method: POST
-    
-    start-simulator:
-      port: "12001"
-      endpoint: /start-simulator
+      endpoint: /algo/order-book
       method: POST
 
 ---
@@ -123,18 +116,15 @@ spec:
   template:
     serviceAccountName: argo-events-sa
   dependencies:
-  - name: start-algo-dep
+  - name: algo-order-book-dep
     eventSourceName: trading-event-source
-    eventName: start-algorithm
-  - name: start-sim-dep
-    eventSourceName: trading-event-source
-    eventName: start-simulator
+    eventName: algo-order-book
     
   triggers:
-  # Trigger 1: Start Order Book Algorithm
+  # Trigger: Start Trading System (Order Book Algo + Trade Simulator in parallel)
   - template:
-      name: start-order-book-algo
-      conditions: start-algo-dep
+      name: start-trading-system
+      conditions: algo-order-book-dep
       argoWorkflow:
         group: argoproj.io
         version: v1alpha1
@@ -145,13 +135,24 @@ spec:
             apiVersion: argoproj.io/v1alpha1
             kind: Workflow
             metadata:
-              generateName: order-book-algo-
+              generateName: trading-system-
               namespace: trading-system
             spec:
-              entrypoint: order-book-algorithm
+              entrypoint: trading-system
               serviceAccountName: argo-workflow-sa
               templates:
-              - name: order-book-algorithm
+              # Main template that runs both components in parallel
+              - name: trading-system
+                dag:
+                  tasks:
+                  - name: order-book-algorithm
+                    template: order-book-algo-task
+                  - name: trade-simulator
+                    template: trade-simulator-task
+                    dependencies: [order-book-algorithm]  # Wait for algo to start first
+                    
+              # Order Book Algorithm Task
+              - name: order-book-algo-task
                 container:
                   image: order-book-algo:latest
                   imagePullPolicy: Never
@@ -187,33 +188,14 @@ spec:
                     echo "Starting order book algorithm..."
                     exec ./order-book-algo
 
-  # Trigger 2: Start Trade Simulator  
-  - template:
-      name: start-trade-simulator
-      conditions: start-sim-dep
-      argoWorkflow:
-        group: argoproj.io
-        version: v1alpha1
-        resource: workflows
-        operation: submit
-        source:
-          resource:
-            apiVersion: argoproj.io/v1alpha1
-            kind: Workflow
-            metadata:
-              generateName: trade-simulator-
-              namespace: trading-system
-            spec:
-              entrypoint: trade-simulator
-              serviceAccountName: argo-workflow-sa
-              templates:
-              - name: trade-simulator
+              # Trade Simulator Task
+              - name: trade-simulator-task
                 container:
                   image: trade-simulator:latest
                   imagePullPolicy: Never
                   env:
                   - name: ALGORITHM_SOURCE_IP
-                    value: "order-book-algo-service"
+                    value: "localhost"  # Connect to algorithm in same workflow pod network
                   - name: ALGORITHM_SOURCE_PORT
                     value: "9999"
                   - name: RUST_LOG
@@ -230,8 +212,10 @@ spec:
                   command: ["/bin/sh", "-c"]
                   args:
                   - |
+                    echo "Waiting for order-book algorithm to start..."
+                    sleep 10
                     echo "Starting trade simulator..."
-                    ./trade-simulator --algo-ip order-book-algo-service --algo-port 9999 --verbose
+                    ./trade-simulator --algo-ip localhost --algo-port 9999 --verbose
 
 ---
 
@@ -328,7 +312,7 @@ spec:
   type: NodePort
 
 ---
-# External access for webhook triggers - FIXED
+# External access for webhook triggers
 apiVersion: v1
 kind: Service
 metadata:
@@ -342,11 +326,7 @@ spec:
   - port: 12000
     targetPort: 12000
     nodePort: 30090
-    name: start-algorithm
-  - port: 12001
-    targetPort: 12001
-    nodePort: 30091
-    name: start-simulator
+    name: algo-order-book
   type: NodePort
 
 ---
@@ -363,6 +343,6 @@ data:
   BIND_ADDR: "0.0.0.0:8888"
   STREAMING_SOURCE_IP: "market-streamer-service.trading-system.svc.cluster.local"
   STREAMING_SOURCE_PORT: "8888"
-  ALGORITHM_SOURCE_IP: "order-book-algo-service.trading-system.svc.cluster.local"
+  ALGORITHM_SOURCE_IP: "localhost"
   ALGORITHM_SOURCE_PORT: "9999"
   RUST_LOG: "info"
