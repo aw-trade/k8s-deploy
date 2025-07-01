@@ -1,0 +1,368 @@
+# ===================================================
+# NAMESPACE
+# ===================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: trading-system
+---
+
+# ===================================================
+# 1. MARKET STREAMER
+# ===================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: market-streamer
+  namespace: trading-system
+  labels:
+    app: market-streamer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: market-streamer
+  template:
+    metadata:
+      labels:
+        app: market-streamer
+    spec:
+      containers:
+      - name: market-streamer
+        image: market-streamer:latest
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8888
+          protocol: UDP
+          name: udp-stream
+        env:
+        - name: BIND_ADDR
+          value: "0.0.0.0:8888"
+        - name: RUST_LOG
+          value: "debug"
+        - name: SERVICE_NAME
+          value: "market-streamer"
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: market-streamer-service
+  namespace: trading-system
+spec:
+  selector:
+    app: market-streamer
+  ports:
+  - port: 8888
+    targetPort: 8888
+    protocol: UDP
+    name: udp-stream
+  type: ClusterIP
+
+---
+
+# ===================================================
+# ARGO EVENTS: EVENT BUS
+# ===================================================
+apiVersion: argoproj.io/v1alpha1
+kind: EventBus
+metadata:
+  name: default
+  namespace: trading-system
+spec:
+  nats:
+    native:
+      replicas: 1
+      auth: none
+
+---
+
+# ===================================================
+# ARGO EVENTS: EVENT SOURCE
+# ===================================================
+apiVersion: argoproj.io/v1alpha1
+kind: EventSource
+metadata:
+  name: trading-event-source
+  namespace: trading-system
+spec:
+  service:
+    ports:
+    - port: 12000
+      targetPort: 12000
+    - port: 12001
+      targetPort: 12001
+  webhook:
+    start-algorithm:
+      port: "12000"
+      endpoint: /start-algorithm
+      method: POST
+    
+    start-simulator:
+      port: "12001"
+      endpoint: /start-simulator
+      method: POST
+
+---
+
+# ===================================================
+# ARGO EVENTS: SENSOR
+# ===================================================
+apiVersion: argoproj.io/v1alpha1
+kind: Sensor
+metadata:
+  name: trading-sensor
+  namespace: trading-system
+spec:
+  template:
+    serviceAccountName: argo-events-sa
+  dependencies:
+  - name: start-algo-dep
+    eventSourceName: trading-event-source
+    eventName: start-algorithm
+  - name: start-sim-dep
+    eventSourceName: trading-event-source
+    eventName: start-simulator
+    
+  triggers:
+  # Trigger 1: Start Order Book Algorithm
+  - template:
+      name: start-order-book-algo
+      conditions: start-algo-dep
+      argoWorkflow:
+        group: argoproj.io
+        version: v1alpha1
+        resource: workflows
+        operation: submit
+        source:
+          resource:
+            apiVersion: argoproj.io/v1alpha1
+            kind: Workflow
+            metadata:
+              generateName: order-book-algo-
+              namespace: trading-system
+            spec:
+              entrypoint: order-book-algorithm
+              serviceAccountName: argo-workflow-sa
+              templates:
+              - name: order-book-algorithm
+                container:
+                  image: order-book-algo:latest
+                  imagePullPolicy: Never
+                  env:
+                  - name: STREAMING_SOURCE_IP
+                    value: "market-streamer-service"
+                  - name: STREAMING_SOURCE_PORT
+                    value: "8888"
+                  - name: RUST_LOG
+                    value: "debug"
+                  - name: SERVICE_NAME
+                    value: "order-book-algo"
+                  ports:
+                  - containerPort: 9999
+                    protocol: UDP
+                  resources:
+                    requests:
+                      memory: "128Mi"
+                      cpu: "100m"
+                    limits:
+                      memory: "256Mi"
+                      cpu: "500m"
+                  command: ["/bin/sh", "-c"]
+                  args:
+                  - |
+                    echo "Waiting for market-streamer service..."
+                    until nslookup market-streamer-service.trading-system.svc.cluster.local; do
+                      echo "Waiting for market-streamer-service DNS..."
+                      sleep 3
+                    done
+                    echo "market-streamer service DNS is ready!"
+                    sleep 5
+                    echo "Starting order book algorithm..."
+                    exec ./order-book-algo
+
+  # Trigger 2: Start Trade Simulator  
+  - template:
+      name: start-trade-simulator
+      conditions: start-sim-dep
+      argoWorkflow:
+        group: argoproj.io
+        version: v1alpha1
+        resource: workflows
+        operation: submit
+        source:
+          resource:
+            apiVersion: argoproj.io/v1alpha1
+            kind: Workflow
+            metadata:
+              generateName: trade-simulator-
+              namespace: trading-system
+            spec:
+              entrypoint: trade-simulator
+              serviceAccountName: argo-workflow-sa
+              templates:
+              - name: trade-simulator
+                container:
+                  image: trade-simulator:latest
+                  imagePullPolicy: Never
+                  env:
+                  - name: ALGORITHM_SOURCE_IP
+                    value: "order-book-algo-service"
+                  - name: ALGORITHM_SOURCE_PORT
+                    value: "9999"
+                  - name: RUST_LOG
+                    value: "debug"
+                  - name: SERVICE_NAME
+                    value: "trade-simulator"
+                  resources:
+                    requests:
+                      memory: "128Mi"
+                      cpu: "100m"
+                    limits:
+                      memory: "256Mi"
+                      cpu: "500m"
+                  command: ["/bin/sh", "-c"]
+                  args:
+                  - |
+                    echo "Starting trade simulator..."
+                    ./trade-simulator --algo-ip order-book-algo-service --algo-port 9999 --verbose
+
+---
+
+# ===================================================
+# SERVICE ACCOUNTS & RBAC
+# ===================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: argo-events-sa
+  namespace: trading-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: argo-workflow-sa
+  namespace: trading-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: argo-events-role
+  namespace: trading-system
+rules:
+- apiGroups: ["argoproj.io"]
+  resources: ["workflows", "workflowtemplates"]
+  verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["pods", "pods/log"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: argo-workflow-role
+  namespace: trading-system
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: argo-events-binding
+  namespace: trading-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: argo-events-role
+subjects:
+- kind: ServiceAccount
+  name: argo-events-sa
+  namespace: trading-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: argo-workflow-binding
+  namespace: trading-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: argo-workflow-role
+subjects:
+- kind: ServiceAccount
+  name: argo-workflow-sa
+  namespace: trading-system
+
+---
+
+# ===================================================
+# EXTERNAL ACCESS VIA NODEPORT
+# ===================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: market-streamer-external
+  namespace: trading-system
+  labels:
+    service: external-access
+spec:
+  selector:
+    app: market-streamer
+  ports:
+  - port: 8888
+    targetPort: 8888
+    nodePort: 30080
+    protocol: UDP
+    name: udp-stream
+  type: NodePort
+
+---
+# External access for webhook triggers - FIXED
+apiVersion: v1
+kind: Service
+metadata:
+  name: trading-webhook-external
+  namespace: trading-system
+spec:
+  selector:
+    controller: eventsource-controller
+    eventsource-name: trading-event-source
+  ports:
+  - port: 12000
+    targetPort: 12000
+    nodePort: 30090
+    name: start-algorithm
+  - port: 12001
+    targetPort: 12001
+    nodePort: 30091
+    name: start-simulator
+  type: NodePort
+
+---
+
+# ===================================================
+# CONFIGMAP FOR CONFIGURATION
+# ===================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trading-config
+  namespace: trading-system
+data:
+  BIND_ADDR: "0.0.0.0:8888"
+  STREAMING_SOURCE_IP: "market-streamer-service.trading-system.svc.cluster.local"
+  STREAMING_SOURCE_PORT: "8888"
+  ALGORITHM_SOURCE_IP: "order-book-algo-service.trading-system.svc.cluster.local"
+  ALGORITHM_SOURCE_PORT: "9999"
+  RUST_LOG: "info"
